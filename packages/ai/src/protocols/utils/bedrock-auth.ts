@@ -6,9 +6,12 @@ import { ProviderShared } from "../shared.js"
 
 /**
  * AWS credentials for SigV4 signing. Bedrock also supports Bearer API key auth,
- * which provider facades configure as route auth instead of SigV4. STS-vended
- * credentials should be refreshed by the consumer (rebuild the model) before
- * they expire; the route does not refresh.
+ * which provider facades configure as route auth instead of SigV4.
+ *
+ * Credentials may be supplied either as a static object or as a resolver that is
+ * invoked on every request. Pass a resolver backed by the AWS credential chain
+ * (e.g. `fromNodeProviderChain`) to get short-lived STS credentials refreshed
+ * automatically before they expire, instead of a fixed snapshot that goes stale.
  */
 export interface Credentials {
   readonly region: string
@@ -16,6 +19,9 @@ export interface Credentials {
   readonly secretAccessKey: string
   readonly sessionToken?: string
 }
+
+/** Resolves fresh SigV4 credentials per request (e.g. from the AWS credential chain). */
+export type CredentialResolver = () => Promise<Credentials>
 
 const signRequest = (input: {
   readonly url: string
@@ -46,26 +52,43 @@ const signRequest = (input: {
       ),
   })
 
-/** Sign the exact JSON bytes with SigV4 using credentials configured on the route. */
+/**
+ * Sign the exact JSON bytes with SigV4 using credentials configured on the route.
+ *
+ * `credentials` may be a static object or a {@link CredentialResolver}. A resolver
+ * is called on every request, so a resolver backed by the AWS credential chain
+ * keeps signing with fresh, unexpired credentials without rebuilding the model.
+ */
 export const sigV4 = (
-  credentials: Credentials | undefined,
+  credentials: Credentials | CredentialResolver | undefined,
   options: { readonly service?: string; readonly name?: string } = {},
 ) =>
   Auth.custom((input: AuthInput) => {
     return Effect.gen(function* () {
+      const name = options.name ?? "Bedrock Converse"
       if (!credentials) {
         return yield* ProviderShared.invalidRequest(
-          `${options.name ?? "Bedrock Converse"} requires either route bearer auth or AWS credentials configured on the route`,
+          `${name} requires either route bearer auth or AWS credentials configured on the route`,
         )
       }
+      const resolved =
+        typeof credentials === "function"
+          ? yield* Effect.tryPromise({
+              try: () => credentials(),
+              catch: (error) =>
+                ProviderShared.invalidRequest(
+                  `${name} credential resolution failed: ${error instanceof Error ? error.message : String(error)}`,
+                ),
+            })
+          : credentials
       const headersForSigning = Headers.set(input.headers, "content-type", "application/json")
       const signed = yield* signRequest({
         url: input.url,
         body: input.body,
         headers: headersForSigning,
-        credentials,
+        credentials: resolved,
         service: options.service ?? "bedrock",
-        name: options.name ?? "Bedrock Converse",
+        name,
       })
       return Headers.setAll(headersForSigning, signed)
     })

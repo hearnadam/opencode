@@ -3,16 +3,19 @@ import { Route, type RouteDefaultsInput } from "../route/client.js"
 import type { ProviderPackage } from "../provider-package.js"
 import { OpenAIChat } from "../protocols/openai-chat.js"
 import { OpenAIResponses } from "../protocols/openai-responses.js"
-import { BedrockAuth, type Credentials } from "../protocols/utils/bedrock-auth.js"
+import { BedrockAuth, type Credentials, type CredentialResolver } from "../protocols/utils/bedrock-auth.js"
 import { ProviderID, type ModelID } from "../schema/index.js"
 import { withOpenAIOptions, type OpenAIProviderOptionsInput } from "./openai-options.js"
+import { AmazonBedrockShared } from "./amazon-bedrock-shared.js"
 
 export const id = ProviderID.make("amazon-bedrock")
 
 export type Config = RouteDefaultsInput & {
   readonly apiKey?: string
   readonly baseURL?: string
-  readonly credentials?: Credentials
+  readonly credentials?: Credentials | CredentialResolver
+  /** AWS profile for the credential chain when signing with SigV4 (no apiKey/credentials). */
+  readonly profile?: string
   readonly region?: string
   readonly providerOptions?: OpenAIProviderOptionsInput
 }
@@ -22,6 +25,7 @@ export interface Settings extends ProviderPackage.Settings {
   readonly auth?: "bearer" | "sigv4"
   readonly baseURL?: string
   readonly credentials?: Credentials
+  readonly profile?: string
   readonly region?: string
   readonly topP?: number
   readonly providerOptions?: OpenAIProviderOptionsInput
@@ -47,8 +51,14 @@ const chatRoute = OpenAIChat.route.with({
 export const routes = [responsesRoute, chatRoute]
 
 const configuredRoute = <Body, Prepared>(route: Route<Body, Prepared>, input: Config) => {
-  const region = input.region ?? input.credentials?.region ?? "us-east-1"
-  const credentials = input.credentials === undefined ? undefined : { ...input.credentials, region }
+  const staticCredentials = typeof input.credentials === "function" ? undefined : input.credentials
+  const region = input.region ?? staticCredentials?.region ?? "us-east-1"
+  const credentials =
+    input.credentials === undefined
+      ? undefined
+      : typeof input.credentials === "function"
+        ? input.credentials
+        : { ...input.credentials, region }
   return route.with({
     endpoint: { baseURL: input.baseURL ?? `https://bedrock-mantle.${region}.api.aws/v1` },
     auth:
@@ -59,14 +69,27 @@ const configuredRoute = <Body, Prepared>(route: Route<Body, Prepared>, input: Co
 }
 
 const defaults = (input: Config) => {
-  const { apiKey: _, baseURL: _baseURL, credentials: _credentials, region: _region, ...rest } = input
+  const { apiKey: _, baseURL: _baseURL, credentials: _credentials, profile: _profile, region: _region, ...rest } = input
   return rest
 }
 
 export const configure = (input: Config = {}) => {
-  const configuredResponsesRoute = configuredRoute(responsesRoute, input)
-  const configuredChatRoute = configuredRoute(chatRoute, input)
-  const modelDefaults = defaults(input)
+  // Default to SigV4 via the AWS credential chain (auto-refreshing) when neither an
+  // API key nor explicit credentials are provided — mirrors google-vertex's ADC. One
+  // shared resolver is built so both routes reuse the same memoized/refreshing chain.
+  const resolved: Config =
+    input.apiKey === undefined && input.credentials === undefined
+      ? {
+          ...input,
+          credentials: AmazonBedrockShared.chainCredentials(
+            input.region ?? "us-east-1",
+            AmazonBedrockShared.profile(input.profile),
+          ),
+        }
+      : input
+  const configuredResponsesRoute = configuredRoute(responsesRoute, resolved)
+  const configuredChatRoute = configuredRoute(chatRoute, resolved)
+  const modelDefaults = defaults(resolved)
   const responses = (modelID: string | ModelID) =>
     configuredResponsesRoute
       .with(withOpenAIOptions(modelID, modelDefaults))
@@ -96,6 +119,7 @@ const config = (settings: Settings): Config => {
     apiKey: settings.auth === "sigv4" ? undefined : settings.apiKey,
     baseURL: settings.baseURL,
     credentials: settings.credentials,
+    profile: settings.profile,
     generation: settings.topP === undefined ? undefined : { topP: settings.topP },
     headers: settings.headers === undefined ? undefined : { ...settings.headers },
     http: settings.body === undefined ? undefined : { body: { ...settings.body } },

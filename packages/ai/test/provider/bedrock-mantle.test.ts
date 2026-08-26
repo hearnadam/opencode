@@ -78,6 +78,39 @@ describe("Amazon Bedrock Mantle provider", () => {
     }),
   )
 
+  it.effect("resolves credentials per request when given a credential resolver (refreshing)", () =>
+    Effect.gen(function* () {
+      let calls = 0
+      const resolver = () => {
+        calls += 1
+        return Promise.resolve({ ...credentials, region: "us-west-1" })
+      }
+      const model = AmazonBedrockMantle.configure({ credentials: resolver, region: "us-west-1" }).responses(
+        "openai.gpt-oss-120b",
+      )
+      const seen: Array<string | undefined> = []
+      const run = LLMClient.generate(LLM.request({ model, prompt: "Hi" })).pipe(
+        Effect.provide(
+          dynamicResponse((input) =>
+            Effect.gen(function* () {
+              const request = yield* HttpClientRequest.toWeb(input.request)
+              seen.push(request.headers.get("authorization") ?? undefined)
+              return input.respond("", { headers: { "content-type": "text/event-stream" } })
+            }),
+          ),
+        ),
+        Effect.flip,
+      )
+      yield* run
+      yield* run
+
+      // The resolver is invoked on every request, so a chain-backed resolver keeps
+      // signing with fresh, unexpired credentials rather than a fixed snapshot.
+      expect(calls).toBe(2)
+      expect(seen[0]).toContain("/us-west-1/bedrock-mantle/aws4_request")
+    }),
+  )
+
   it.effect("supports bearer authentication and custom base URLs", () =>
     Effect.gen(function* () {
       const seen: Array<{ readonly url: string; readonly authorization: string | undefined }> = []
